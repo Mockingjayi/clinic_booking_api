@@ -1,11 +1,12 @@
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -18,6 +19,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 API_KEY = os.environ["API_KEY"]
+
+# The real limit is 5 attempts per email per minute.
+# The setting below only exists so you can raise it while testing on your own computer.
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "5"))
+WINDOW_SECONDS = 60
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -55,6 +61,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     response JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS booking_attempts (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT NOT NULL,
+    attempted_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS attempts_by_email
+    ON booking_attempts (email, attempted_at);
 """
 
 
@@ -118,6 +131,7 @@ async def reset(request: Request):
     body = await request.json()
     slots = body.get("slots", [])
     with pool.connection() as conn:
+        conn.execute("DELETE FROM booking_attempts")
         conn.execute("DELETE FROM idempotency_keys")
         conn.execute("DELETE FROM bookings")
         conn.execute("DELETE FROM slots")
@@ -159,6 +173,40 @@ def list_slots(provider: str | None = None):
     }
 
 
+def check_rate_limit(conn, email):
+    """Uses one ticket for this email.
+    Returns None if the attempt is allowed, or the number of seconds to wait."""
+    # Only one request at a time can count tickets for the same email.
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (email,))
+
+    # Tickets older than 60 seconds are given back.
+    conn.execute(
+        """
+        DELETE FROM booking_attempts
+        WHERE email = %s AND attempted_at <= clock_timestamp() - interval '60 seconds'
+        """,
+        (email,),
+    )
+
+    row = conn.execute(
+        """
+        SELECT count(*) AS used, min(attempted_at) AS oldest, clock_timestamp() AS now
+        FROM booking_attempts
+        WHERE email = %s
+        """,
+        (email,),
+    ).fetchone()
+
+    if row["used"] >= RATE_LIMIT:
+        wait = (
+            row["oldest"] + timedelta(seconds=WINDOW_SECONDS) - row["now"]
+        ).total_seconds()
+        return max(1, math.ceil(wait))
+
+    conn.execute("INSERT INTO booking_attempts (email) VALUES (%s)", (email,))
+    return None
+
+
 def make_booking(conn, slot_id, name, email):
     """Tries to create a booking. Returns (status_code, response_body)."""
     slot = conn.execute("SELECT * FROM slots WHERE id = %s", (slot_id,)).fetchone()
@@ -183,6 +231,28 @@ def make_booking(conn, slot_id, name, email):
     return 201, booking_json(row)
 
 
+def process_booking(conn, body):
+    """Checks the details, then tries to book. Returns (status_code, response_body)."""
+    slot_id = body.get("slot_id")
+    name = body.get("name")
+    email = body.get("email")
+
+    if not isinstance(slot_id, str) or not slot_id.strip():
+        return 400, {"error": "slot_id is required"}
+    if not isinstance(name, str) or not name.strip():
+        return 400, {"error": "name is required"}
+    if not isinstance(email, str) or not email.strip():
+        return 400, {"error": "email is required"}
+
+    name = name.strip()
+    email = email.strip().lower()
+
+    if not EMAIL_RE.match(email):
+        return 400, {"error": "email is not valid"}
+
+    return make_booking(conn, slot_id, name, email)
+
+
 @app.post("/bookings")
 async def create_booking(request: Request):
     try:
@@ -192,29 +262,19 @@ async def create_booking(request: Request):
     if not isinstance(body, dict):
         return err(400, "request body must be a JSON object")
 
-    slot_id = body.get("slot_id")
-    name = body.get("name")
-    email = body.get("email")
-
-    if not isinstance(slot_id, str) or not slot_id.strip():
-        return err(400, "slot_id is required")
-    if not isinstance(name, str) or not name.strip():
-        return err(400, "name is required")
-    if not isinstance(email, str) or not email.strip():
-        return err(400, "email is required")
-
-    name = name.strip()
-    email = email.strip().lower()
-
-    if not EMAIL_RE.match(email):
-        return err(400, "email is not valid")
-
     idem_key = request.headers.get("Idempotency-Key") or None
     body_hash = hashlib.sha256(
         json.dumps(body, sort_keys=True).encode()
     ).hexdigest()
 
+    # The email that the rate limit counts against. If there is no email, nothing to count.
+    raw_email = body.get("email")
+    rate_email = None
+    if isinstance(raw_email, str) and raw_email.strip():
+        rate_email = raw_email.strip().lower()
+
     with pool.connection() as conn:
+        # Step 1: safe retries. A repeated request gets the saved answer.
         if idem_key:
             claimed = conn.execute(
                 """
@@ -239,8 +299,21 @@ async def create_booking(request: Request):
                     status_code=saved["status_code"], content=saved["response"]
                 )
 
-        status, payload = make_booking(conn, slot_id, name, email)
+        # Step 2: the spam limit. Every new attempt uses one ticket.
+        if rate_email:
+            wait = check_rate_limit(conn, rate_email)
+            if wait is not None:
+                conn.rollback()
+                return JSONResponse(
+                    status_code=429,
+                    content={"error": "too many attempts, try again later"},
+                    headers={"Retry-After": str(wait)},
+                )
 
+        # Step 3: check the details and book.
+        status, payload = process_booking(conn, body)
+
+        # Step 4: save the answer for safe retries.
         if idem_key:
             conn.execute(
                 """

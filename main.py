@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import re
 import secrets
@@ -10,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -45,6 +48,13 @@ CREATE TABLE IF NOT EXISTS bookings (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_confirmed_per_slot
     ON bookings (slot_id) WHERE status = 'confirmed';
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    idem_key TEXT PRIMARY KEY,
+    body_hash TEXT NOT NULL,
+    status_code INTEGER,
+    response JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -108,6 +118,7 @@ async def reset(request: Request):
     body = await request.json()
     slots = body.get("slots", [])
     with pool.connection() as conn:
+        conn.execute("DELETE FROM idempotency_keys")
         conn.execute("DELETE FROM bookings")
         conn.execute("DELETE FROM slots")
         with conn.cursor() as cur:
@@ -148,7 +159,31 @@ def list_slots(provider: str | None = None):
     }
 
 
-@app.post("/bookings", status_code=201)
+def make_booking(conn, slot_id, name, email):
+    """Tries to create a booking. Returns (status_code, response_body)."""
+    slot = conn.execute("SELECT * FROM slots WHERE id = %s", (slot_id,)).fetchone()
+    if not slot:
+        return 404, {"error": "slot not found"}
+    if slot["start_at"] <= datetime.now(timezone.utc):
+        return 400, {"error": "slot has already started"}
+
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                """
+                INSERT INTO bookings (id, slot_id, name, email, status)
+                VALUES (%s, %s, %s, %s, 'confirmed')
+                RETURNING *
+                """,
+                (str(uuid.uuid4()), slot_id, name, email),
+            ).fetchone()
+    except pg_errors.UniqueViolation:
+        return 409, {"error": "slot already booked"}
+
+    return 201, booking_json(row)
+
+
+@app.post("/bookings")
 async def create_booking(request: Request):
     try:
         body = await request.json()
@@ -174,29 +209,93 @@ async def create_booking(request: Request):
     if not EMAIL_RE.match(email):
         return err(400, "email is not valid")
 
-    try:
-        with pool.connection() as conn:
-            slot = conn.execute(
-                "SELECT * FROM slots WHERE id = %s", (slot_id,)
-            ).fetchone()
-            if not slot:
-                return err(404, "slot not found")
-            if slot["start_at"] <= datetime.now(timezone.utc):
-                return err(400, "slot has already started")
+    idem_key = request.headers.get("Idempotency-Key") or None
+    body_hash = hashlib.sha256(
+        json.dumps(body, sort_keys=True).encode()
+    ).hexdigest()
 
-            booking_id = str(uuid.uuid4())
-            row = conn.execute(
+    with pool.connection() as conn:
+        if idem_key:
+            claimed = conn.execute(
                 """
-                INSERT INTO bookings (id, slot_id, name, email, status)
-                VALUES (%s, %s, %s, %s, 'confirmed')
-                RETURNING *
+                INSERT INTO idempotency_keys (idem_key, body_hash)
+                VALUES (%s, %s)
+                ON CONFLICT (idem_key) DO NOTHING
+                RETURNING idem_key
                 """,
-                (booking_id, slot_id, name, email),
+                (idem_key, body_hash),
             ).fetchone()
-    except pg_errors.UniqueViolation:
-        return err(409, "slot already booked")
+            if not claimed:
+                saved = conn.execute(
+                    "SELECT * FROM idempotency_keys WHERE idem_key = %s",
+                    (idem_key,),
+                ).fetchone()
+                if saved["body_hash"] != body_hash:
+                    return err(
+                        422,
+                        "Idempotency-Key was already used with a different request body",
+                    )
+                return JSONResponse(
+                    status_code=saved["status_code"], content=saved["response"]
+                )
 
-    return booking_json(row)
+        status, payload = make_booking(conn, slot_id, name, email)
+
+        if idem_key:
+            conn.execute(
+                """
+                UPDATE idempotency_keys
+                SET status_code = %s, response = %s
+                WHERE idem_key = %s
+                """,
+                (status, Jsonb(payload), idem_key),
+            )
+
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.get("/bookings")
+def list_bookings(request: Request):
+    params = request.query_params
+
+    email = (params.get("email") or "").strip().lower()
+    if not email:
+        return err(400, "email is required")
+
+    try:
+        limit = int(params.get("limit", "10"))
+    except ValueError:
+        return err(400, "limit must be a whole number from 1 to 50")
+    if limit < 1 or limit > 50:
+        return err(400, "limit must be a whole number from 1 to 50")
+
+    after = 0
+    cursor = params.get("cursor")
+    if cursor:
+        try:
+            after = int(cursor)
+        except ValueError:
+            return err(400, "cursor is not valid")
+
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM bookings
+            WHERE lower(email) = %s AND seq > %s
+            ORDER BY seq
+            LIMIT %s
+            """,
+            (email, after, limit + 1),
+        ).fetchall()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = str(page[-1]["seq"]) if has_more else None
+
+    return {
+        "bookings": [booking_json(r) for r in page],
+        "next_cursor": next_cursor,
+    }
 
 
 @app.get("/bookings/{booking_id}")

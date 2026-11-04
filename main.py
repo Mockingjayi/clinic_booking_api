@@ -7,10 +7,11 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -24,6 +25,8 @@ API_KEY = os.environ["API_KEY"]
 # The setting below only exists so you can raise it while testing on your own computer.
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "5"))
 WINDOW_SECONDS = 60
+
+INDEX_FILE = Path(__file__).parent / "index.html"
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -89,6 +92,10 @@ def err(status, message):
 
 @app.middleware("http")
 async def check_api_key(request: Request, call_next):
+    # The web page itself is public. Every API call it makes still carries the key.
+    if request.url.path == "/app" and request.method in ("GET", "HEAD"):
+        return await call_next(request)
+
     sent = request.headers.get("X-API-Key", "")
     if not secrets.compare_digest(sent.encode(), API_KEY.encode()):
         return err(401, "invalid or missing API key")
@@ -103,6 +110,12 @@ async def http_exc(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_exc(request: Request, exc: RequestValidationError):
     return err(400, "invalid request")
+
+
+@app.api_route("/app", methods=["GET", "HEAD"], response_class=HTMLResponse)
+def web_page():
+    html = INDEX_FILE.read_text(encoding="utf-8")
+    return HTMLResponse(html.replace("__API_KEY__", json.dumps(API_KEY)))
 
 
 def iso(dt: datetime) -> str:

@@ -4,7 +4,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-BASE = "http://localhost:8000"
+BASE = os.environ.get("BASE_URL", "http://localhost:8000")
 KEY = os.environ["API_KEY"]
 
 

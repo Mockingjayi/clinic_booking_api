@@ -5,7 +5,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-BASE = "http://localhost:8000"
+BASE = os.environ.get("BASE_URL", "http://localhost:8000")
 KEY = os.environ["API_KEY"]
 
 
